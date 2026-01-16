@@ -1,0 +1,306 @@
+/*
+  2-Motor Obstacle Avoiding Robot (L298N + HC-SR04 + SG90 servo “radar”)
+
+  WHAT IT DOES
+  - Normally drives forward continuously.
+  - Measures distance straight ahead using HC-SR04 mounted on an SG90 servo.
+  - If an obstacle is closer than STOP_DISTANCE_CM:
+      1) Stop
+      2) (Optional) reverse a little
+      3) Look LEFT and measure
+      4) Look RIGHT and measure
+      5) Turn toward the side with more free space
+      6) Continue forward
+
+  WIRING YOU SPECIFIED
+  - L298N:
+      IN1 = D11
+      IN2 = D10
+      IN3 = D9
+      IN4 = D8
+    (This code assumes ENA/ENB jumpers are ON, or ENA/ENB are tied HIGH)
+
+  - HC-SR04:
+      TRIG = A0
+      ECHO = A1
+
+  - SG90:
+      SIGNAL = D12
+
+  IMPORTANT HARDWARE NOTES (SERVO ISSUES ARE USUALLY POWER)
+  - Servo often needs its own stable 5V supply (UBEC / 4xAA / etc.).
+    If powered from Arduino 5V while motors run, it may not move or may reset the Arduino.
+  - ALWAYS connect grounds together:
+      Arduino GND <-> L298N GND <-> HC-SR04 GND <-> Servo GND
+
+  NOTE ABOUT SERVO LIBRARY ON UNO/NANO:
+  - The Servo library uses Timer1, which disables analogWrite PWM on pins 9 and 10.
+  - We are NOT using analogWrite here; we only use pins 9/10 as normal digital outputs,
+    so this is OK.
+*/
+
+#include <Servo.h>
+
+// ----------------------- L298N Motor Pins -----------------------
+const int IN1 = 11;   // Motor A direction pin 1
+const int IN2 = 10;   // Motor A direction pin 2
+const int IN3 = 9;    // Motor B direction pin 1
+const int IN4 = 8;    // Motor B direction pin 2
+
+// ----------------------- HC-SR04 Pins ---------------------------
+const int TRIG_PIN = A0;  // A0 used as DIGITAL output for trigger
+const int ECHO_PIN = A1;  // A1 used as DIGITAL input for echo
+
+// ----------------------- SG90 Servo Pin -------------------------
+const int SERVO_PIN = 12; // Servo signal pin (does NOT need a "~ PWM" pin with Servo library)
+
+// ----------------------- Behavior Settings ----------------------
+const float STOP_DISTANCE_CM = 10.0;  // If distance < 10cm, obstacle is considered "too close"
+
+// Servo angles (adjust to your mounting)
+const int CENTER_ANGLE = 90;  // straight ahead
+const int LEFT_ANGLE   = 150; // look left
+const int RIGHT_ANGLE  = 30;  // look right
+
+// Timing (tune these for your robot/chassis)
+const int SERVO_SETTLE_MS = 350; // time to allow servo to reach position & vibration to settle
+const int REVERSE_TIME_MS = 250; // small reverse time to create turning room
+const int TURN_TIME_MS    = 450; // pivot turn duration (bigger = more turning)
+
+// Ultrasonic read settings
+const unsigned long ECHO_TIMEOUT_US = 25000UL; // 25ms ~ about 4 meters max range
+const int DIST_SAMPLES = 3;                    // average samples for stability
+
+// ----------------------- Global Objects -------------------------
+Servo scanServo;
+
+// ----------------------- Setup -------------------------
+void setup() {
+  // Motor pins as outputs
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW); // keep trigger low by default
+
+  // Attach servo
+  // If your servo barely moves or buzzes, you can try a wider pulse range:
+  // scanServo.attach(SERVO_PIN, 500, 2400);
+  scanServo.attach(SERVO_PIN);
+
+  // Center sensor at start
+  scanServo.write(CENTER_ANGLE);
+  delay(500);
+
+  // Serial is optional but very helpful for debugging distances
+  Serial.begin(9600);
+  Serial.println("Robot start: driving forward until obstacle < 10cm...");
+
+  // Start moving
+  runForward();
+}
+
+// ----------------------- Main Loop -------------------------
+void loop() {
+  // 1) Look forward and measure distance
+  scanServo.write(CENTER_ANGLE);
+  delay(80); // small delay to reduce jitter while driving
+
+  float front = readDistanceCM(DIST_SAMPLES);
+
+  Serial.print("Front (cm): ");
+  Serial.println(front);
+
+  // 2) If reading is invalid (timeout/no echo), treat as "clear" and keep going
+  //    pulseIn() returns 0 on timeout; we convert that to -1 in readDistanceCM().
+  if (front < 0 || front >= STOP_DISTANCE_CM) {
+    runForward();
+    delay(30);
+    return; // go back to start of loop
+  }
+
+  // 3) Obstacle is too close
+  //    Stop, then scan left/right and decide where to turn
+  stopMotors();
+  delay(120);
+
+  // Optional: back up a little to make turning easier (especially if very close)
+  runBackward();
+  delay(REVERSE_TIME_MS);
+  stopMotors();
+  delay(100);
+
+  // 4) Scan left then right
+  float leftD  = lookAndMeasure(LEFT_ANGLE);
+  float rightD = lookAndMeasure(RIGHT_ANGLE);
+
+  // Return sensor to center after scanning
+  scanServo.write(CENTER_ANGLE);
+  delay(150);
+
+  Serial.print("Left (cm): ");
+  Serial.print(leftD);
+  Serial.print(" | Right (cm): ");
+  Serial.println(rightD);
+
+  // 5) Handle invalid readings:
+  //    If left/right reads invalid (-1), treat it as very far away (open space).
+  if (leftD < 0)  leftD = 999.0;
+  if (rightD < 0) rightD = 999.0;
+
+  // 6) Decide direction:
+  //    Turn toward the larger distance (more free space).
+  //    If both sides are still "blocked", do a bigger escape move.
+  if (leftD > rightD && leftD > STOP_DISTANCE_CM) {
+    turnLeftPivot();
+  } else if (rightD > leftD && rightD > STOP_DISTANCE_CM) {
+    turnRightPivot();
+  } else {
+    // Both sides look bad -> reverse more and do a stronger turn
+    runBackward();
+    delay(350);
+    stopMotors();
+    delay(100);
+
+    // choose a default escape turn (you can swap to right if preferred)
+    turnLeftPivot();
+  }
+
+  // Next loop iteration will drive forward again.
+}
+
+// ============================================================================
+//                         ULTRASONIC / SERVO FUNCTIONS
+// ============================================================================
+
+/*
+  lookAndMeasure(angle)
+  - Moves the servo to the given angle
+  - Waits for the servo to settle
+  - Reads distance a few times and averages it
+*/
+float lookAndMeasure(int angle) {
+  scanServo.write(angle);
+  delay(SERVO_SETTLE_MS);           // allow servo to physically reach the new angle
+  return readDistanceCM(DIST_SAMPLES);
+}
+
+/*
+  readDistanceCM(samples)
+  - Triggers the HC-SR04
+  - Uses pulseIn to measure echo time
+  - Converts time to centimeters
+  - Takes multiple samples and averages valid ones
+
+  Returns:
+  - average distance in cm
+  - -1 if no valid reading (timeout / out-of-range)
+*/
+float readDistanceCM(int samples) {
+  float sum = 0.0;
+  int good = 0;
+
+  for (int i = 0; i < samples; i++) {
+    // Create a 10us trigger pulse
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    // Measure how long echo stays HIGH
+    unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+
+    // duration == 0 means timeout (no echo)
+    if (duration > 0) {
+      // HC-SR04 conversion: distance(cm) = duration(us) / 58
+      float cm = (float)duration / 58.0;
+
+      // Basic sanity filter to reject weird values
+      if (cm >= 2.0 && cm <= 400.0) {
+        sum += cm;
+        good++;
+      }
+    }
+
+    delay(20); // small gap between samples
+  }
+
+  if (good == 0) return -1.0; // no valid readings
+  return sum / good;
+}
+
+// ============================================================================
+//                               MOTOR FUNCTIONS
+// ============================================================================
+
+/*
+  L298N direction logic using IN1..IN4 only.
+  - Forward:  INx = HIGH/LOW
+  - Backward: INx = LOW/HIGH
+  - Stop:     LOW/LOW
+*/
+
+void runForward() {
+  // Motor A forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Motor B forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void runBackward() {
+  // Motor A backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  // Motor B backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void stopMotors() {
+  // Stop both motors (coast or brake depends on driver; this is "low/low")
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+/*
+  Pivot turns:
+  - Left pivot:  left motor backward, right motor forward
+  - Right pivot: left motor forward,  right motor backward
+  Adjust TURN_TIME_MS to change how much it turns.
+*/
+void turnLeftPivot() {
+  // Left motor (Motor A) backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  // Right motor (Motor B) forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  delay(TURN_TIME_MS);
+  stopMotors();
+  delay(80);
+}
+
+void turnRightPivot() {
+  // Left motor (Motor A) forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Right motor (Motor B) backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  delay(TURN_TIME_MS);
+  stopMotors();
+  delay(80);
+}
