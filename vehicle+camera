@@ -1,0 +1,181 @@
+// ===========================
+// Arduino Nano: L298N + HC-SR04 + USB Serial Commands
+// ===========================
+
+// -------- L298N input pins (direction control) --------
+// These go to IN1..IN4 on the L298N board.
+const int IN1 = 3;   // Left motor pair direction pin 1
+const int IN2 = 4;   // Left motor pair direction pin 2
+const int IN3 = 5;   // Right motor pair direction pin 1
+const int IN4 = 6;   // Right motor pair direction pin 2
+
+// -------- Ultrasonic pins (HC-SR04) --------
+const int echoPin = 7;   // Echo returns pulse width proportional to distance
+const int trigPin = 8;   // Trigger sends a 10us pulse to start measurement
+
+// -------- Safety settings --------
+const float HARD_STOP_CM = 12.0f;          // Block FORWARD if closer than this
+const unsigned long DIST_UPDATE_MS = 80;   // Update distance periodically
+
+// Latest distance reading (cm). -1 means invalid/no echo.
+float lastDistance = -1;
+unsigned long lastUpdate = 0;
+
+// Track current commanded motion so we can auto-stop if forward becomes unsafe.
+char currentCmd = 'S';
+
+// -------- Motor helper functions --------
+void stopMotors() {
+  // All LOW = stop both channels
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void forwardMotors() {
+  // Both sides forward
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void backwardMotors() {
+  // Both sides backward
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void turnLeftPivot() {
+  // Pivot: left side backward, right side forward
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void turnRightPivot() {
+  // Pivot: left side forward, right side backward
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+// -------- Ultrasonic distance read --------
+float readDistanceCM() {
+  // Trigger pulse sequence
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(4);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // Measure how long echo stays HIGH (timeout 60ms)
+  unsigned long us = pulseIn(echoPin, HIGH, 60000UL);
+
+  // If timeout, return invalid
+  if (us == 0) return -1;
+
+  // Convert microseconds to cm:
+  // sound speed ~0.0343 cm/us; divide by 2 because signal goes forth+back
+  float cm = (us * 0.0343f) / 2.0f;
+
+  // Reject nonsense values
+  if (cm < 1.5f || cm > 400.0f) return -1;
+
+  return cm;
+}
+
+void updateDistanceIfDue() {
+  // Update distance only every DIST_UPDATE_MS
+  unsigned long now = millis();
+  if (now - lastUpdate >= DIST_UPDATE_MS) {
+    lastUpdate = now;
+    lastDistance = readDistanceCM();
+  }
+}
+
+bool tooCloseForForward() {
+  // Forward should be blocked if we have a valid distance under HARD_STOP_CM
+  return (lastDistance > 0 && lastDistance < HARD_STOP_CM);
+}
+
+// -------- Command handling --------
+void applyCommand(char c) {
+  // Always allow S/B/L/R even when close.
+  // Only block F when close.
+  switch (c) {
+    case 'S':
+      stopMotors();
+      currentCmd = 'S';
+      break;
+
+    case 'B':
+      backwardMotors();
+      currentCmd = 'B';
+      break;
+
+    case 'L':
+      turnLeftPivot();
+      currentCmd = 'L';
+      break;
+
+    case 'R':
+      turnRightPivot();
+      currentCmd = 'R';
+      break;
+
+    case 'F':
+      if (tooCloseForForward()) {
+        // If too close, ignore forward and stop instead
+        stopMotors();
+        currentCmd = 'S';
+      } else {
+        forwardMotors();
+        currentCmd = 'F';
+      }
+      break;
+
+    default:
+      // Ignore unknown characters
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);        // USB serial to Pi
+
+  // Motor pins output
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  stopMotors();                // safe startup
+
+  // Ultrasonic pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  delay(200);
+  Serial.println("READY");
+}
+
+void loop() {
+  // Refresh ultrasonic distance periodically
+  updateDistanceIfDue();
+
+  // If we are currently moving forward and suddenly too close → stop
+  if (currentCmd == 'F' && tooCloseForForward()) {
+    stopMotors();
+    currentCmd = 'S';
+  }
+
+  // Handle serial commands from Pi
+  if (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '?') {
+      // Distance request: reply D:<cm> or D:-1
+      Serial.print("D:");
+      if (lastDistance < 0) Serial.println("-1");
+      else Serial.println(lastDistance, 1);
+    } else if (c == '\n' || c == '\r') {
+      // Ignore newlines
+    } else {
+      // Execute motion command
+      applyCommand(c);
+    }
+  }
+}
