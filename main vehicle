@@ -12,13 +12,12 @@
       5) Turn toward the side with more free space
       6) Continue forward
 
-  WIRING YOU SPECIFIED
   - L298N:
       IN1 = D11
       IN2 = D10
       IN3 = D9
       IN4 = D8
-    (This code assumes ENA/ENB jumpers are ON, or ENA/ENB are tied HIGH)
+    (This code assumes ENA/ENB jumpers are ON)
 
   - HC-SR04:
       TRIG = A0
@@ -26,17 +25,6 @@
 
   - SG90:
       SIGNAL = D12
-
-  IMPORTANT HARDWARE NOTES (SERVO ISSUES ARE USUALLY POWER)
-  - Servo often needs its own stable 5V supply (UBEC / 4xAA / etc.).
-    If powered from Arduino 5V while motors run, it may not move or may reset the Arduino.
-  - ALWAYS connect grounds together:
-      Arduino GND <-> L298N GND <-> HC-SR04 GND <-> Servo GND
-
-  NOTE ABOUT SERVO LIBRARY ON UNO/NANO:
-  - The Servo library uses Timer1, which disables analogWrite PWM on pins 9 and 10.
-  - We are NOT using analogWrite here; we only use pins 9/10 as normal digital outputs,
-    so this is OK.
 */
 
 #include <Servo.h>
@@ -57,12 +45,12 @@ const int SERVO_PIN = 12; // Servo signal pin (does NOT need a "~ PWM" pin with 
 // ----------------------- Behavior Settings ----------------------
 const float STOP_DISTANCE_CM = 10.0;  // If distance < 10cm, obstacle is considered "too close"
 
-// Servo angles (adjust to your mounting)
+// Servo angles 
 const int CENTER_ANGLE = 90;  // straight ahead
 const int LEFT_ANGLE   = 150; // look left
 const int RIGHT_ANGLE  = 30;  // look right
 
-// Timing (tune these for your robot/chassis)
+// Timing 
 const int SERVO_SETTLE_MS = 350; // time to allow servo to reach position & vibration to settle
 const int REVERSE_TIME_MS = 250; // small reverse time to create turning room
 const int TURN_TIME_MS    = 450; // pivot turn duration (bigger = more turning)
