@@ -43,7 +43,7 @@ const int ECHO_PIN = A1;  // A1 used as DIGITAL input for echo
 const int SERVO_PIN = 12; // Servo signal pin (does NOT need a "~ PWM" pin with Servo library)
 
 // ----------------------- Behavior Settings ----------------------
-const float STOP_DISTANCE_CM = 10.0;  // If distance < 10cm, obstacle is considered "too close"
+const float STOP_DISTANCE_CM = 20.0;  // If distance < 10cm, obstacle is considered "too close"
 
 // Servo angles 
 const int CENTER_ANGLE = 90;  // straight ahead
