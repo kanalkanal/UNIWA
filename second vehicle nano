@@ -1,62 +1,124 @@
-// ===========================
-// Arduino Nano: L298N + HC-SR04 + USB Serial Commands
-// ===========================
+/*
+  ===========================
+  Arduino Nano Motor Controller (L298N) + HC-SR04 + USB Serial
+  ===========================
 
-// -------- L298N input pins (direction control) --------
-// These go to IN1..IN4 on the L298N board.
-const int IN1 = 3;   // Left motor pair direction pin 1
-const int IN2 = 4;   // Left motor pair direction pin 2
-const int IN3 = 5;   // Right motor pair direction pin 1
-const int IN4 = 6;   // Right motor pair direction pin 2
+  PURPOSE
+  - Control two motor channels via L298N:
+      Channel A = Left motor pair
+      Channel B = Right motor pair
+  - Control speed using PWM on ENA/ENB pins (recommended)
+  - Read ultrasonic distance (HC-SR04) and provide it via serial to the Pi
+  - Safety: BLOCK FORWARD only if too close; allow L/R/B to escape.
 
-// -------- Ultrasonic pins (HC-SR04) --------
-const int echoPin = 7;   // Echo returns pulse width proportional to distance
-const int trigPin = 8;   // Trigger sends a 10us pulse to start measurement
+  WIRING (as requested)
+  - IN1 = D3
+  - IN2 = D4
+  - IN3 = D5
+  - IN4 = D6
 
-// -------- Safety settings --------
-const float HARD_STOP_CM = 12.0f;          // Block FORWARD if closer than this
-const unsigned long DIST_UPDATE_MS = 80;   // Update distance periodically
+  ADD FOR SPEED (PWM)
+  - ENA = D9  (remove ENA jumper on L298N)
+  - ENB = D10 (remove ENB jumper on L298N)
 
-// Latest distance reading (cm). -1 means invalid/no echo.
-float lastDistance = -1;
-unsigned long lastUpdate = 0;
+  ULTRASONIC
+  - TRIG = D8
+  - ECHO = D7
 
-// Track current commanded motion so we can auto-stop if forward becomes unsafe.
-char currentCmd = 'S';
+  SERIAL COMMANDS (send lines ending with '\n')
+  - "F"  forward
+  - "B"  backward
+  - "L"  pivot left
+  - "R"  pivot right
+  - "S"  stop
+  - "?"  distance query -> Nano replies "D:<cm>" or "D:-1"
+  - "VF180" sets forward speed (0..255)
+  - "VB160" sets backward speed (0..255)
+  - "VT220" sets turn speed (0..255)
+*/
 
-// -------- Motor helper functions --------
+#include <Arduino.h>
+
+// ---------- L298N direction pins ----------
+const int IN1 = 3;   // Left channel direction
+const int IN2 = 4;   // Left channel direction
+const int IN3 = 5;   // Right channel direction
+const int IN4 = 6;   // Right channel direction
+
+// ---------- L298N enable pins (PWM speed control) ----------
+const int ENA = 9;   // PWM for left channel (ENA jumper removed)
+const int ENB = 10;  // PWM for right channel (ENB jumper removed)
+
+// ---------- Ultrasonic pins ----------
+const int echoPin = 7;
+const int trigPin = 8;
+
+// ---------- Speed settings (0..255) ----------
+int speedF = 200;    // forward speed
+int speedB = 200;    // backward speed
+int speedT = 200;    // turning speed
+
+// ---------- Ultrasonic filtering ----------
+const unsigned long PING_TIMEOUT_US = 60000UL;  // 60ms max
+const unsigned long DIST_UPDATE_MS  = 80;       // update every ~80ms
+const float EMA_ALPHA = 0.35f;                  // smoothing (0.2..0.5)
+float distFiltered = -1.0f;                     // smoothed distance
+unsigned long lastDistUpdate = 0;
+
+// ---------- Safety ----------
+const float HARD_STOP_CM = 12.0f;               // block forward under this
+char currentCmd = 'S';                          // remember last motion command
+
+// ---------- Serial line buffer ----------
+char lineBuf[32];
+uint8_t linePos = 0;
+
+// ---------- Helpers: motor low-level ----------
+void setPWM(int leftPWM, int rightPWM) {
+  // Clamp and apply PWM to ENA/ENB (speed control)
+  leftPWM  = constrain(leftPWM, 0, 255);
+  rightPWM = constrain(rightPWM, 0, 255);
+  analogWrite(ENA, leftPWM);
+  analogWrite(ENB, rightPWM);
+}
+
 void stopMotors() {
-  // All LOW = stop both channels
+  // Stop direction pins and cut PWM
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  setPWM(0, 0);
 }
 
 void forwardMotors() {
-  // Both sides forward
+  // Left forward, Right forward
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  setPWM(speedF, speedF);
 }
 
 void backwardMotors() {
-  // Both sides backward
+  // Left backward, Right backward
   digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
   digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setPWM(speedB, speedB);
 }
 
-void turnLeftPivot() {
-  // Pivot: left side backward, right side forward
+void pivotLeft() {
+  // Pivot: left backward, right forward
   digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  setPWM(speedT, speedT);
 }
 
-void turnRightPivot() {
-  // Pivot: left side forward, right side backward
+void pivotRight() {
+  // Pivot: left forward, right backward
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setPWM(speedT, speedT);
 }
 
-// -------- Ultrasonic distance read --------
-float readDistanceCM() {
+// ---------- Ultrasonic raw ping ----------
+float pingOnceCM() {
   // Trigger pulse sequence
   digitalWrite(trigPin, LOW);
   delayMicroseconds(4);
@@ -64,64 +126,72 @@ float readDistanceCM() {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // Measure how long echo stays HIGH (timeout 60ms)
-  unsigned long us = pulseIn(echoPin, HIGH, 60000UL);
+  // Measure echo pulse width
+  unsigned long us = pulseIn(echoPin, HIGH, PING_TIMEOUT_US);
+  if (us == 0) return -1.0f;
 
-  // If timeout, return invalid
-  if (us == 0) return -1;
-
-  // Convert microseconds to cm:
-  // sound speed ~0.0343 cm/us; divide by 2 because signal goes forth+back
+  // Convert to cm (speed of sound approx 0.0343 cm/us)
   float cm = (us * 0.0343f) / 2.0f;
-
-  // Reject nonsense values
-  if (cm < 1.5f || cm > 400.0f) return -1;
-
+  if (cm < 1.5f || cm > 400.0f) return -1.0f;
   return cm;
 }
 
+// Median of 3 (reject spikes)
+float median3(float a, float b, float c) {
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
+
+float readDistanceMedian3() {
+  // Read 3 pings separated slightly (reduces random jitter)
+  float a = pingOnceCM(); delay(20);
+  float b = pingOnceCM(); delay(20);
+  float c = pingOnceCM();
+
+  // If all invalid, return invalid
+  if (a < 0 && b < 0 && c < 0) return -1.0f;
+
+  // Replace invalid with large sentinel so median selects a real value
+  if (a < 0) a = 9999;
+  if (b < 0) b = 9999;
+  if (c < 0) c = 9999;
+
+  float m = median3(a, b, c);
+  if (m > 1000) return -1.0f;
+  return m;
+}
+
 void updateDistanceIfDue() {
-  // Update distance only every DIST_UPDATE_MS
+  // Update distance at controlled rate (avoids blocking too often)
   unsigned long now = millis();
-  if (now - lastUpdate >= DIST_UPDATE_MS) {
-    lastUpdate = now;
-    lastDistance = readDistanceCM();
-  }
+  if (now - lastDistUpdate < DIST_UPDATE_MS) return;
+  lastDistUpdate = now;
+
+  float m = readDistanceMedian3();
+  if (m < 0) return; // keep old filtered value if read fails
+
+  // Exponential moving average smoothing
+  if (distFiltered < 0) distFiltered = m;
+  else distFiltered = distFiltered + EMA_ALPHA * (m - distFiltered);
 }
 
 bool tooCloseForForward() {
-  // Forward should be blocked if we have a valid distance under HARD_STOP_CM
-  return (lastDistance > 0 && lastDistance < HARD_STOP_CM);
+  // Only block forward if we have a valid filtered distance under HARD_STOP_CM
+  return (distFiltered > 0 && distFiltered < HARD_STOP_CM);
 }
 
-// -------- Command handling --------
-void applyCommand(char c) {
-  // Always allow S/B/L/R even when close.
-  // Only block F when close.
+// ---------- Apply motion command ----------
+void applyMotion(char c) {
+  // Always allow S/B/L/R even if close (so the robot can escape)
+  // Only block F when too close
   switch (c) {
-    case 'S':
-      stopMotors();
-      currentCmd = 'S';
-      break;
-
-    case 'B':
-      backwardMotors();
-      currentCmd = 'B';
-      break;
-
-    case 'L':
-      turnLeftPivot();
-      currentCmd = 'L';
-      break;
-
-    case 'R':
-      turnRightPivot();
-      currentCmd = 'R';
-      break;
-
+    case 'S': stopMotors();   currentCmd = 'S'; break;
+    case 'B': backwardMotors(); currentCmd = 'B'; break;
+    case 'L': pivotLeft();    currentCmd = 'L'; break;
+    case 'R': pivotRight();   currentCmd = 'R'; break;
     case 'F':
       if (tooCloseForForward()) {
-        // If too close, ignore forward and stop instead
         stopMotors();
         currentCmd = 'S';
       } else {
@@ -129,53 +199,85 @@ void applyCommand(char c) {
         currentCmd = 'F';
       }
       break;
-
     default:
-      // Ignore unknown characters
+      // ignore unknown
       break;
   }
 }
 
-void setup() {
-  Serial.begin(115200);        // USB serial to Pi
+// ---------- Parse line commands like "VF180" ----------
+void parseLine(char* s) {
+  // Distance request
+  if (s[0] == '?' && s[1] == '\0') {
+    Serial.print("D:");
+    if (distFiltered < 0) Serial.println("-1");
+    else Serial.println(distFiltered, 1);
+    return;
+  }
 
-  // Motor pins output
+  // Speed commands: VFxxx, VBxxx, VTxxx
+  if (s[0] == 'V' && s[1] != '\0') {
+    int val = 0;
+
+    if (s[1] == 'F') { val = atoi(&s[2]); speedF = constrain(val, 0, 255); }
+    else if (s[1] == 'B') { val = atoi(&s[2]); speedB = constrain(val, 0, 255); }
+    else if (s[1] == 'T') { val = atoi(&s[2]); speedT = constrain(val, 0, 255); }
+    // optional: you can add more speed categories later
+
+    return;
+  }
+
+  // Motion commands: single letter F/B/L/R/S
+  if (s[1] == '\0') {
+    applyMotion(s[0]);
+    return;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configure motor pins
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-  stopMotors();                // safe startup
 
-  // Ultrasonic pins
+  // Configure enable pins (PWM)
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // Configure ultrasonic pins
   pinMode(trigPin, OUTPUT);
   pinMode(echoPin, INPUT);
 
+  stopMotors();
   delay(200);
   Serial.println("READY");
 }
 
 void loop() {
-  // Refresh ultrasonic distance periodically
+  // Update distance in background
   updateDistanceIfDue();
 
-  // If we are currently moving forward and suddenly too close → stop
+  // If we are currently moving forward and suddenly become too close: stop
   if (currentCmd == 'F' && tooCloseForForward()) {
     stopMotors();
     currentCmd = 'S';
   }
 
-  // Handle serial commands from Pi
-  if (Serial.available()) {
+  // Read serial bytes and build a line until '\n'
+  while (Serial.available()) {
     char c = Serial.read();
-
-    if (c == '?') {
-      // Distance request: reply D:<cm> or D:-1
-      Serial.print("D:");
-      if (lastDistance < 0) Serial.println("-1");
-      else Serial.println(lastDistance, 1);
-    } else if (c == '\n' || c == '\r') {
-      // Ignore newlines
+    if (c == '\r') continue;                 // ignore CR
+    if (c == '\n') {                         // end of line
+      lineBuf[linePos] = '\0';               // null-terminate
+      if (linePos > 0) parseLine(lineBuf);   // parse if non-empty
+      linePos = 0;                           // reset buffer
     } else {
-      // Execute motion command
-      applyCommand(c);
+      if (linePos < sizeof(lineBuf) - 1) {
+        lineBuf[linePos++] = c;              // store char
+      } else {
+        linePos = 0;                          // overflow -> reset
+      }
     }
   }
 }
